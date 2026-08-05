@@ -52,6 +52,16 @@ impl Registry {
         entries
     }
 
+    /// Whether this registry holds any entry.
+    ///
+    /// A registry can end up empty because [`Self::load`] falls back to an empty
+    /// map when no entry directory exists, which happens for registries that are
+    /// only mapped to carry tags (for example `minecraft:block`).
+    #[must_use]
+    pub fn has_entries(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     #[must_use]
     pub const fn get_registry_key(&self) -> &RegistryKey {
         &self.key

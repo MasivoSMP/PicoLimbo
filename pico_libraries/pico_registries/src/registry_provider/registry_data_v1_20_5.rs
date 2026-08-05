@@ -34,6 +34,11 @@ pub fn get_registry_data_v1_20_5(
     Ok(registries
         .iter()
         .filter_map(|registry_keys| registry_manager.try_get(registry_keys))
+        // Registries that only exist to carry tags have no entry directory and load
+        // empty. Sending an empty Registry Data packet for them carries no
+        // information, and clients that do not expect the registry to be synced at
+        // all can fail hard on it (Geyser throws on `minecraft:block`).
+        .filter(|registry| registry.has_entries())
         .map(|registry| {
             let registry_entries = registry
                 .get_entries()
