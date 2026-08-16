@@ -28,6 +28,74 @@ pub enum ConfigError {
 
     #[error("Failed to apply environment placeholders: {0}")]
     EnvPlaceholder(#[from] EnvPlaceholderError),
+
+    #[error("Invalid configuration: {0}")]
+    Invalid(String),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MasivoReturnConfig {
+    pub enabled: bool,
+    pub bind: String,
+    pub shared_secret: String,
+    pub return_host: String,
+    pub return_port: u16,
+    pub players_per_tick: usize,
+    pub release_window_seconds: u64,
+}
+
+impl Default for MasivoReturnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:8090".into(),
+            shared_secret: String::new(),
+            return_host: "play.example.com".into(),
+            return_port: 25565,
+            players_per_tick: 3,
+            release_window_seconds: 60,
+        }
+    }
+}
+
+impl MasivoReturnConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.bind.parse::<std::net::SocketAddr>().is_err() {
+            return Err(ConfigError::Invalid(
+                "masivo_return.bind must be an IP address and port".into(),
+            ));
+        }
+        if self.shared_secret.len() < 32 {
+            return Err(ConfigError::Invalid(
+                "masivo_return.shared_secret must contain at least 32 characters".into(),
+            ));
+        }
+        if self.return_host.is_empty()
+            || !self
+                .return_host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':'))
+        {
+            return Err(ConfigError::Invalid(
+                "masivo_return.return_host is invalid".into(),
+            ));
+        }
+        if self.return_port == 0 || self.players_per_tick == 0 {
+            return Err(ConfigError::Invalid(
+                "masivo_return return_port and players_per_tick must be positive".into(),
+            ));
+        }
+        if self.release_window_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "masivo_return.release_window_seconds must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Application configuration, serializable to/from TOML.
@@ -79,6 +147,8 @@ pub struct Config {
     pub title: TitleConfig,
 
     pub commands: CommandsConfig,
+
+    pub masivo_return: MasivoReturnConfig,
 }
 
 impl Default for Config {
@@ -102,6 +172,7 @@ impl Default for Config {
             fly: FlyConfig::default(),
             accept_transfers: false,
             commands: CommandsConfig::default(),
+            masivo_return: MasivoReturnConfig::default(),
         }
     }
 }
@@ -120,6 +191,7 @@ pub fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
         } else {
             let expanded_toml_str = expand_env_placeholders(&raw_toml_str)?;
             let cfg: Config = toml::from_str(expanded_toml_str.as_ref())?;
+            cfg.masivo_return.validate()?;
             Ok(cfg)
         }
     } else {

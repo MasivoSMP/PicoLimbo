@@ -1,5 +1,6 @@
 use crate::server::batch::{Batch, BatchItem};
 use crate::server::client_data::ClientData;
+use crate::server::masivo_return::{ReturnController, TransferTarget};
 use crate::server::packet_handler::{PacketHandler, PacketHandlerError};
 use crate::server::packet_registry::{
     PacketRegistry, PacketRegistryDecodeError, PacketRegistryEncodeError,
@@ -11,27 +12,35 @@ use futures::StreamExt;
 use minecraft_packets::login::login_disconnect_packet::LoginDisconnectPacket;
 use minecraft_packets::play::client_bound_keep_alive_packet::ClientBoundKeepAlivePacket;
 use minecraft_packets::play::disconnect_packet::DisconnectPacket;
+use minecraft_packets::play::transfer_packet::TransferPacket;
 use minecraft_protocol::prelude::State;
+use minecraft_protocol::prelude::{ProtocolVersion, VarInt};
 use net::packet_stream::PacketStreamError;
 use net::raw_packet::RawPacket;
 use std::num::TryFromIntError;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 pub struct Server {
     state: Arc<RwLock<ServerState>>,
     listen_address: ServerAddress,
+    return_controller: Option<ReturnController>,
 }
 
 impl Server {
-    pub fn new(listen_address: &ServerAddress, state: ServerState) -> Self {
+    pub fn new(
+        listen_address: &ServerAddress,
+        state: ServerState,
+        return_controller: Option<ReturnController>,
+    ) -> Self {
         Self {
             state: Arc::new(RwLock::new(state)),
             listen_address: listen_address.clone(),
+            return_controller,
         }
     }
 
@@ -45,6 +54,16 @@ impl Server {
         };
 
         info!("Listening on: {}", self.listen_address);
+        if let Some(controller) = self.return_controller.clone() {
+            let control_listener = match controller.bind().await {
+                Ok(listener) => listener,
+                Err(reason) => {
+                    error!("Failed to bind Masivo return control: {reason}");
+                    return;
+                }
+            };
+            tokio::spawn(controller.serve(control_listener));
+        }
         self.accept(&listener, cancellation_token).await;
     }
 
@@ -59,9 +78,10 @@ impl Server {
                     match accept_result {
                         Ok((socket, addr)) => {
                             debug!("Accepted connection from {}", addr);
-                        let state_clone = Arc::clone(&self.state);
+                            let state_clone = Arc::clone(&self.state);
+                            let return_controller = self.return_controller.clone();
                             tokio::spawn(async move {
-                                handle_client(socket, state_clone).await;
+                                handle_client(socket, state_clone, return_controller).await;
                             });
                         }
                         Err(e) => {
@@ -241,6 +261,7 @@ async fn read(
     client_data: &ClientData,
     server_state: &Arc<RwLock<ServerState>>,
     was_in_play_state: &mut bool,
+    return_commands: &mut mpsc::UnboundedReceiver<TransferTarget>,
 ) -> Result<(), PacketProcessingError> {
     tokio::select! {
         result = client_data.read_packet() => {
@@ -250,18 +271,43 @@ async fn read(
         () = client_data.keep_alive_tick() => {
             send_keep_alive(client_data).await?;
         }
+        Some(target) = return_commands.recv() => {
+            if send_transfer(client_data, target).await? {
+                return Err(PacketProcessingError::Disconnected);
+            }
+        }
     }
     Ok(())
 }
 
-async fn handle_client(socket: TcpStream, server_state: Arc<RwLock<ServerState>>) {
+async fn handle_client(
+    socket: TcpStream,
+    server_state: Arc<RwLock<ServerState>>,
+    return_controller: Option<ReturnController>,
+) {
     let keep_alive_interval = server_state.read().await.keep_alive_interval();
     let client_data = ClientData::new(socket, keep_alive_interval);
     let mut was_in_play_state = false;
+    let (return_sender, mut return_commands) = mpsc::unbounded_channel();
+    let mut return_client_id = None;
 
     loop {
-        match read(&client_data, &server_state, &mut was_in_play_state).await {
-            Ok(()) => {}
+        match read(
+            &client_data,
+            &server_state,
+            &mut was_in_play_state,
+            &mut return_commands,
+        )
+        .await
+        {
+            Ok(()) => {
+                if was_in_play_state
+                    && return_client_id.is_none()
+                    && let Some(controller) = &return_controller
+                {
+                    return_client_id = Some(controller.register(return_sender.clone()).await);
+                }
+            }
             Err(PacketProcessingError::Disconnected) => {
                 debug!("Client disconnected");
                 break;
@@ -277,6 +323,9 @@ async fn handle_client(socket: TcpStream, server_state: Arc<RwLock<ServerState>>
         }
     }
 
+    if let (Some(controller), Some(client_id)) = (&return_controller, return_client_id) {
+        controller.unregister(client_id).await;
+    }
     let _ = client_data.shutdown().await;
 
     if was_in_play_state {
@@ -284,6 +333,32 @@ async fn handle_client(socket: TcpStream, server_state: Arc<RwLock<ServerState>>
         let username = client_data.client().await.get_username();
         info!("{} left the game", username);
     }
+}
+
+async fn send_transfer(
+    client_data: &ClientData,
+    target: TransferTarget,
+) -> Result<bool, PacketProcessingError> {
+    let (protocol_version, state, username) = {
+        let client = client_data.client().await;
+        (
+            client.protocol_version(),
+            client.clientbound_state(),
+            client.get_username(),
+        )
+    };
+    if state != State::Play || !protocol_version.is_after_inclusive(ProtocolVersion::V1_20_5) {
+        return Ok(false);
+    }
+    info!("Returning {username} to {}:{}", target.host, target.port);
+    let packet = PacketRegistry::Transfer(TransferPacket::new(
+        &target.host,
+        &VarInt::from(i32::from(target.port)),
+    ));
+    client_data
+        .write_packet(packet.encode_packet(protocol_version)?)
+        .await?;
+    Ok(true)
 }
 
 async fn kick_client(

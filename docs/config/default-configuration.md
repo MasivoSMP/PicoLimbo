@@ -115,5 +115,14 @@ spawn = "spawn"
 fly = "fly"
 fly_speed = "flyspeed"
 transfer = "transfer"
+
+[masivo_return]
+enabled = false
+bind = "127.0.0.1:8090"
+shared_secret = ""
+return_host = "play.example.com"
+return_port = 25565
+players_per_tick = 3
+release_window_seconds = 60
 ```
 :::

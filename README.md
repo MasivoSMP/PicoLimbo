@@ -101,6 +101,14 @@ the [documentation website](https://picolimbo.quozul.dev/).
 For detailed installation instructions, configuration options, and usage examples, please visit the documentation
 website.
 
+## MasivoRestart return control
+
+This MasivoSMP fork can return maintenance players to Velocity through a private, HMAC-authenticated HTTP endpoint.
+Enable `[masivo_return]` in `server.toml`, bind it to a private address, and use the same 32+ character secret as
+MasivoRestart. `POST /v1/release` queues existing players at `players_per_tick` every 50 ms; players joining during
+`release_window_seconds` are returned immediately. The destination Velocity proxy must enable `accepts-transfers`.
+Keep both hosts' clocks synchronized; signed requests expire after 30 seconds.
+
 ---
 
 ## Similar Projects

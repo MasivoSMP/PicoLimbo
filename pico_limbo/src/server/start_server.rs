@@ -6,6 +6,7 @@ use crate::configuration::config::{Config, ConfigError, load_or_create};
 use crate::configuration::tab_list::TabListMode;
 use crate::configuration::title::TitleConfig;
 use crate::configuration::world_config::boundaries::BoundariesConfig;
+use crate::server::masivo_return::ReturnController;
 use crate::server::network::Server;
 use crate::server::server_address::ServerAddress;
 use crate::server_state::{ServerState, ServerStateBuilderError};
@@ -30,12 +31,13 @@ pub async fn start_server(cli: &Cli, cancellation_token: Option<&CancellationTok
         bind.set_port(port);
     }
 
+    let return_controller = ReturnController::new(cfg.masivo_return.clone());
     match build_state(cfg) {
         Ok(server_state) => {
             if !cli.skip_banner {
                 banner::display_banner();
             }
-            Server::new(&bind, server_state)
+            Server::new(&bind, server_state, return_controller)
                 .run(cancellation_token)
                 .await;
             ExitCode::SUCCESS
@@ -61,6 +63,9 @@ fn load_configuration(config_path: &Path) -> Option<Config> {
         }
         Err(ConfigError::TomlSerialize(message, ..)) => {
             error!("Failed to save default configuration file: {}", message);
+        }
+        Err(ConfigError::Invalid(message)) => {
+            error!("Invalid configuration: {}", message);
         }
         Ok(cfg) => return Some(cfg),
     }
