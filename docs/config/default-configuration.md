@@ -123,6 +123,5 @@ shared_secret = ""
 return_host = "play.example.com"
 return_port = 25565
 players_per_tick = 3
-release_window_seconds = 60
 ```
 :::

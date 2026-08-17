@@ -42,7 +42,6 @@ pub struct MasivoReturnConfig {
     pub return_host: String,
     pub return_port: u16,
     pub players_per_tick: usize,
-    pub release_window_seconds: u64,
 }
 
 impl Default for MasivoReturnConfig {
@@ -54,7 +53,6 @@ impl Default for MasivoReturnConfig {
             return_host: "play.example.com".into(),
             return_port: 25565,
             players_per_tick: 3,
-            release_window_seconds: 60,
         }
     }
 }
@@ -91,11 +89,6 @@ impl MasivoReturnConfig {
         if self.return_port == 0 || self.players_per_tick == 0 {
             return Err(ConfigError::Invalid(
                 "masivo_return return_port and players_per_tick must be positive".into(),
-            ));
-        }
-        if self.release_window_seconds == 0 {
-            return Err(ConfigError::Invalid(
-                "masivo_return.release_window_seconds must be positive".into(),
             ));
         }
         Ok(())

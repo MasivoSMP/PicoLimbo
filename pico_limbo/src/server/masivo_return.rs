@@ -3,7 +3,7 @@ use hmac::KeyInit;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::Instant;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -35,13 +34,8 @@ pub struct ReturnController {
 
 struct ControllerState {
     clients: HashMap<u64, mpsc::UnboundedSender<TransferTarget>>,
-    released_operations: HashSet<Uuid>,
-    active: Option<ActiveRelease>,
-}
-
-struct ActiveRelease {
-    operation_id: Uuid,
-    expires_at: Instant,
+    operation_id: Option<Uuid>,
+    redirecting: bool,
 }
 
 struct ReleaseOutcome {
@@ -55,8 +49,8 @@ impl ReturnController {
             config: Arc::new(config),
             state: Arc::new(Mutex::new(ControllerState {
                 clients: HashMap::new(),
-                released_operations: HashSet::new(),
-                active: None,
+                operation_id: None,
+                redirecting: false,
             })),
             next_client_id: Arc::new(AtomicU64::new(1)),
         })
@@ -90,9 +84,9 @@ impl ReturnController {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().await;
         state.clients.insert(id, sender.clone());
-        let release_active = active_operation(&mut state).is_some();
+        let redirecting = state.redirecting;
         drop(state);
-        if release_active {
+        if redirecting {
             let _ = sender.send(self.target());
         }
         id
@@ -102,20 +96,22 @@ impl ReturnController {
         self.state.lock().await.clients.remove(&id);
     }
 
-    async fn release(&self, operation_id: Uuid) -> ReleaseOutcome {
+    async fn release(&self, operation_id: Uuid) -> Result<ReleaseOutcome, Uuid> {
         let senders = {
             let mut state = self.state.lock().await;
-            if !state.released_operations.insert(operation_id) {
-                return ReleaseOutcome {
+            if let Some(active) = state.operation_id
+                && active != operation_id
+            {
+                return Err(active);
+            }
+            if state.redirecting && state.operation_id == Some(operation_id) {
+                return Ok(ReleaseOutcome {
                     queued: 0,
                     duplicate: true,
-                };
+                });
             }
-            state.active = Some(ActiveRelease {
-                operation_id,
-                expires_at: Instant::now()
-                    + Duration::from_secs(self.config.release_window_seconds),
-            });
+            state.operation_id = Some(operation_id);
+            state.redirecting = true;
             state.clients.values().cloned().collect::<Vec<_>>()
         };
         let queued = senders.len();
@@ -132,16 +128,23 @@ impl ReturnController {
                 }
             }
         });
-        ReleaseOutcome {
+        Ok(ReleaseOutcome {
             queued,
             duplicate: false,
-        }
+        })
     }
 
-    async fn status(&self) -> (usize, Option<Uuid>) {
+    async fn enter_maintenance(&self, operation_id: Uuid) -> bool {
         let mut state = self.state.lock().await;
-        let active = active_operation(&mut state);
-        (state.clients.len(), active)
+        let duplicate = !state.redirecting && state.operation_id == Some(operation_id);
+        state.operation_id = Some(operation_id);
+        state.redirecting = false;
+        duplicate
+    }
+
+    async fn status(&self) -> (usize, bool, Option<Uuid>) {
+        let state = self.state.lock().await;
+        (state.clients.len(), state.redirecting, state.operation_id)
     }
 
     fn target(&self) -> TransferTarget {
@@ -152,20 +155,9 @@ impl ReturnController {
     }
 }
 
-fn active_operation(state: &mut ControllerState) -> Option<Uuid> {
-    if state
-        .active
-        .as_ref()
-        .is_some_and(|active| active.expires_at <= Instant::now())
-    {
-        state.active = None;
-    }
-    state.active.as_ref().map(|active| active.operation_id)
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReleaseRequest {
+struct ControlRequest {
     operation_id: String,
 }
 
@@ -198,22 +190,25 @@ async fn handle_request(mut stream: TcpStream, controller: &ReturnController) ->
 
     match (request.method.as_str(), request.path.as_str()) {
         ("POST", "/v1/release") => {
-            let payload: ReleaseRequest = match serde_json::from_slice(&request.body) {
-                Ok(payload) => payload,
-                Err(reason) => {
-                    write_response(&mut stream, 400, r#"{"error":"invalid JSON"}"#).await?;
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
-                }
-            };
-            let operation_id = match Uuid::parse_str(&payload.operation_id) {
+            let operation_id = match parse_operation_id(&request.body) {
                 Ok(operation_id) => operation_id,
                 Err(reason) => {
-                    write_response(&mut stream, 400, r#"{"error":"invalid operation UUID"}"#)
-                        .await?;
+                    write_response(&mut stream, 400, &format!(r#"{{"error":"{reason}"}}"#)).await?;
                     return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
                 }
             };
-            let outcome = controller.release(operation_id).await;
+            let outcome = match controller.release(operation_id).await {
+                Ok(outcome) => outcome,
+                Err(active) => {
+                    write_response(
+                        &mut stream,
+                        409,
+                        &format!(r#"{{"error":"operation mismatch","operation_id":"{active}"}}"#),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             info!(
                 "Masivo return operation {operation_id} accepted; {} player(s) queued",
                 outcome.queued
@@ -228,19 +223,50 @@ async fn handle_request(mut stream: TcpStream, controller: &ReturnController) ->
             )
             .await?;
         }
-        ("GET", "/v1/status") => {
-            let (connected, operation_id) = controller.status().await;
-            let operation = operation_id.map_or_else(|| "null".into(), |id| format!(r#""{id}""#));
+        ("POST", "/v1/maintenance") => {
+            let operation_id = match parse_operation_id(&request.body) {
+                Ok(operation_id) => operation_id,
+                Err(reason) => {
+                    write_response(&mut stream, 400, &format!(r#"{{"error":"{reason}"}}"#)).await?;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+                }
+            };
+            let duplicate = controller.enter_maintenance(operation_id).await;
+            info!("Masivo maintenance operation {operation_id} accepted");
             write_response(
                 &mut stream,
                 200,
-                &format!(r#"{{"connected":{connected},"active_operation":{operation}}}"#),
+                &format!(
+                    r#"{{"operation_id":"{operation_id}","maintenance":true,"duplicate":{duplicate}}}"#,
+                ),
+            )
+            .await?;
+        }
+        ("GET", "/v1/status") => {
+            let (connected, redirecting, operation_id) = controller.status().await;
+            let operation = operation_id.map_or_else(|| "null".into(), |id| format!(r#""{id}""#));
+            let mode = if redirecting {
+                "redirecting"
+            } else {
+                "maintenance"
+            };
+            write_response(
+                &mut stream,
+                200,
+                &format!(
+                    r#"{{"connected":{connected},"mode":"{mode}","operation_id":{operation}}}"#
+                ),
             )
             .await?;
         }
         _ => write_response(&mut stream, 404, r#"{"error":"not found"}"#).await?,
     }
     Ok(())
+}
+
+fn parse_operation_id(body: &[u8]) -> Result<Uuid, &'static str> {
+    let payload: ControlRequest = serde_json::from_slice(body).map_err(|_| "invalid JSON")?;
+    Uuid::parse_str(&payload.operation_id).map_err(|_| "invalid operation UUID")
 }
 
 async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
@@ -371,6 +397,7 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> io::
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        409 => "Conflict",
         404 => "Not Found",
         408 => "Request Timeout",
         _ => "Error",
@@ -387,9 +414,9 @@ mod tests {
     use super::*;
     use std::fmt::Write;
 
-    fn signed_request(body: &[u8], timestamp: u64, secret: &str) -> HttpRequest {
+    fn signed_request(path: &str, body: &[u8], timestamp: u64, secret: &str) -> HttpRequest {
         let method = "POST".to_string();
-        let path = "/v1/release".to_string();
+        let path = path.to_string();
         let mut signed = format!("{timestamp}\n{method}\n{path}\n").into_bytes();
         signed.extend_from_slice(body);
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
@@ -414,6 +441,7 @@ mod tests {
     fn rejects_tampered_release_requests() {
         let secret = "0123456789abcdef0123456789abcdef";
         let mut request = signed_request(
+            "/v1/release",
             br#"{"operation_id":"00000000-0000-0000-0000-000000000001"}"#,
             100,
             secret,
@@ -425,6 +453,20 @@ mod tests {
         assert!(verify_request(&request, secret, 100).is_ok());
         request.body = b"tampered".to_vec();
         assert!(verify_request(&request, secret, 100).is_err());
+    }
+
+    #[test]
+    fn verifies_java_maintenance_signature() {
+        let request = signed_request(
+            "/v1/maintenance",
+            br#"{"operation_id":"00000000-0000-0000-0000-000000000001"}"#,
+            100,
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert_eq!(
+            request.headers["x-masivo-signature"],
+            "36e5d326601665b509895ac5b4256def4bc69375feb774129171337bae47a8f8"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -444,7 +486,7 @@ mod tests {
             receivers.push(receiver);
         }
 
-        let outcome = controller.release(Uuid::new_v4()).await;
+        let outcome = controller.release(Uuid::new_v4()).await.unwrap();
         assert_eq!(outcome.queued, 7);
         tokio::task::yield_now().await;
         assert_eq!(
@@ -475,5 +517,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn redirects_new_clients_until_maintenance_starts() {
+        let controller = ReturnController::new(MasivoReturnConfig {
+            enabled: true,
+            shared_secret: "0123456789abcdef0123456789abcdef".into(),
+            ..MasivoReturnConfig::default()
+        })
+        .unwrap();
+        let operation_id = Uuid::new_v4();
+        controller.release(operation_id).await.unwrap();
+
+        let (redirect_sender, mut redirect_receiver) = mpsc::unbounded_channel();
+        controller.register(redirect_sender).await;
+        assert!(redirect_receiver.try_recv().is_ok());
+
+        let maintenance_id = Uuid::new_v4();
+        controller.enter_maintenance(maintenance_id).await;
+        assert!(matches!(
+            controller.release(operation_id).await,
+            Err(active) if active == maintenance_id
+        ));
+        let (maintenance_sender, mut maintenance_receiver) = mpsc::unbounded_channel();
+        controller.register(maintenance_sender).await;
+        assert!(maintenance_receiver.try_recv().is_err());
     }
 }
