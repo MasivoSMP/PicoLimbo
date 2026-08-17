@@ -285,6 +285,7 @@ jobs:
           ./gradlew build
 
       - name: Publish Java Wrapper to Modrinth
+        if: ${{ env.MODRINTH_TOKEN != '' }}
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
         run: ./gradlew :wrapper:modrinth -x :wrapper:jar
