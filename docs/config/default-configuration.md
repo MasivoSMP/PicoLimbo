@@ -118,7 +118,7 @@ transfer = "transfer"
 
 [masivo_return]
 enabled = false
-bind = "127.0.0.1:8090"
+control_address = "127.0.0.1:8090"
 shared_secret = ""
 return_host = "play.example.com"
 return_port = 25565

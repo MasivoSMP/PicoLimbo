@@ -63,11 +63,14 @@ impl ReturnController {
     }
 
     pub(super) async fn bind(&self) -> io::Result<TcpListener> {
-        TcpListener::bind(&self.config.bind).await
+        TcpListener::bind(&self.config.control_address).await
     }
 
     pub(super) async fn serve(self, listener: TcpListener) {
-        info!("Masivo return control listening on {}", self.config.bind);
+        info!(
+            "Masivo return control listening on {}",
+            self.config.control_address
+        );
         loop {
             match listener.accept().await {
                 Ok((stream, address)) => {

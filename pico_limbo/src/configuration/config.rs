@@ -37,7 +37,7 @@ pub enum ConfigError {
 #[serde(default)]
 pub struct MasivoReturnConfig {
     pub enabled: bool,
-    pub bind: String,
+    pub control_address: String,
     pub shared_secret: String,
     pub return_host: String,
     pub return_port: u16,
@@ -49,7 +49,7 @@ impl Default for MasivoReturnConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind: "127.0.0.1:8090".into(),
+            control_address: "127.0.0.1:8090".into(),
             shared_secret: String::new(),
             return_host: "play.example.com".into(),
             return_port: 25565,
@@ -64,9 +64,13 @@ impl MasivoReturnConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.bind.parse::<std::net::SocketAddr>().is_err() {
+        if self
+            .control_address
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+        {
             return Err(ConfigError::Invalid(
-                "masivo_return.bind must be an IP address and port".into(),
+                "masivo_return.control_address must be an IP address and port".into(),
             ));
         }
         if self.shared_secret.len() < 32 {
@@ -95,6 +99,19 @@ impl MasivoReturnConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn return_control_has_a_distinct_address_key() {
+        let config = toml::Value::try_from(Config::default()).unwrap();
+        let section = config.get("masivo_return").unwrap();
+        assert!(section.get("control_address").is_some());
+        assert!(section.get("bind").is_none());
     }
 }
 
